@@ -10,9 +10,14 @@ import (
 )
 
 type CacheServer struct {
-	listenAddr string
-	servers    []string
-	cache      *DNSCache
+	listenAddrs []string
+	servers     []*DNSServer
+	cache       *DNSCache
+}
+
+type DNSServer struct {
+	client *dns.Client
+	addr   string
 }
 
 type DNSCacheItem struct {
@@ -47,7 +52,7 @@ func (dc *DNSCache) findResponse(req *dns.Msg) (*dns.Msg, error) {
 			if item.isTimeout() {
 				delete(dc.cache, key)
 			} else {
-				zap.L().Debug("find response from cache", zap.String("req", fmt.Sprintf("%v", req ) ), zap.String("resp", fmt.Sprintf("%v", item.resp )))
+				zap.L().Debug("find response from cache", zap.String("req", fmt.Sprintf("%v", req)), zap.String("resp", fmt.Sprintf("%v", item.resp)))
 
 				return item.resp, nil
 			}
@@ -73,7 +78,7 @@ func (dc *DNSCache) cacheResponse(req *dns.Msg, resp *dns.Msg) {
 	if len(resp.Answer) > 0 {
 		key, err := dc.getKey(req)
 		if err == nil {
-			zap.L().Debug("cache response", zap.String("req", fmt.Sprintf("%v", req ) ), zap.String("resp", fmt.Sprintf("%v", resp)))
+			zap.L().Debug("cache response", zap.String("req", fmt.Sprintf("%v", req)), zap.String("resp", fmt.Sprintf("%v", resp)))
 			item := NewDNSCacheItem(resp)
 			dc.Lock()
 			defer dc.Unlock()
@@ -98,42 +103,75 @@ func parseDNSServerAddr(dnsServerAddr string) (proto string, addr string, err er
 	return parseListenAddr(dnsServerAddr)
 }
 
-func NewCacheServer(listenAddr string, servers []string) *CacheServer {
-	return &CacheServer{listenAddr: listenAddr, servers: servers, cache: NewDNSCache()}
+func NewDNSServer(server string) (*DNSServer, error) {
+	proto, addr, err := parseDNSServerAddr(server)
+	if err != nil {
+		zap.L().Error("fail to parse server address", zap.String("address", server))
+		return nil, err
+	}
+	return &DNSServer{client: &dns.Client{Net: proto}, addr: addr}, nil
+}
+
+func (ds *DNSServer) Exchange(req *dns.Msg) (*dns.Msg, error) {
+	resp, _, err := ds.client.Exchange(req, ds.addr)
+	return resp, err
+}
+
+func NewCacheServer(listenAddrs []string, servers []string) *CacheServer {
+	dnsServers := make([]*DNSServer, 0)
+	for _, server := range servers {
+		dnsServer, err := NewDNSServer(server)
+
+		if err != nil {
+			continue
+		}
+		dnsServers = append(dnsServers, dnsServer)
+	}
+
+	return &CacheServer{listenAddrs: listenAddrs, servers: dnsServers, cache: NewDNSCache()}
 }
 
 func (cs *CacheServer) start() error {
-	proto, addr, err := parseListenAddr(cs.listenAddr)
-	if err != nil {
-		zap.L().Error("Fail to parse the listen address", zap.String("address", cs.listenAddr))
-		return err
-	}
-	dns.HandleFunc(".", cs.processDNSMsg)
+	for _, listenAddr := range cs.listenAddrs {
+		proto, addr, err := parseListenAddr(listenAddr)
+		if err != nil {
+			zap.L().Error("Fail to parse the listen address", zap.String("address", listenAddr))
+			return err
+		}
+		dns.HandleFunc(".", cs.processDNSMsg)
 
-	if proto == "udp" {
-		return cs.startUDPServer(addr)
-	} else if proto == "tcp" {
-		return cs.startTCPServer(addr)
-	} else {
-		zap.L().Error("Unsupported protocol", zap.String("protocol", proto))
-		return fmt.Errorf("Unsupported protocol %s", proto)
+		if proto == "udp" {
+			err = cs.startUDPServer(addr)
+			if err != nil {
+				return err
+			}
+		} else if proto == "tcp" {
+			err := cs.startTCPServer(addr)
+			if err != nil {
+				return err
+			}
+		} else {
+			zap.L().Error("Unsupported protocol", zap.String("protocol", proto))
+			return fmt.Errorf("Unsupported protocol %s", proto)
+		}
 	}
+	return nil
 }
 
 func (cs *CacheServer) startUDPServer(addr string) error {
 	udpServer := &dns.Server{Addr: addr, Net: "udp"}
-	zap.L().Info("start udp DNS server", zap.String("address", addr) )
+	zap.L().Info("start udp DNS server", zap.String("address", addr))
 	return udpServer.ListenAndServe()
 }
 
 func (cs *CacheServer) startTCPServer(addr string) error {
 	tcpServer := &dns.Server{Addr: addr, Net: "tcp"}
- 	zap.L().Info("start tcp DNS server", zap.String("address", addr) )
+	zap.L().Info("start tcp DNS server", zap.String("address", addr))
 	return tcpServer.ListenAndServe()
 }
 
 func (cs *CacheServer) processDNSMsg(w dns.ResponseWriter, req *dns.Msg) {
-	zap.L().Debug("process request", zap.String("request", fmt.Sprintf("%v", req) ) )
+	zap.L().Debug("process request", zap.String("request", fmt.Sprintf("%v", req)))
 	resp, err := cs.cache.findResponse(req)
 	if err == nil {
 		resp.Id = req.Id
@@ -141,16 +179,13 @@ func (cs *CacheServer) processDNSMsg(w dns.ResponseWriter, req *dns.Msg) {
 		return
 	}
 	for _, server := range cs.servers {
-		proto, addr, err := parseDNSServerAddr(server)
-		zap.L().Info("send request to DNS server", zap.String("server", server))
-		c := &dns.Client{Net: proto}
-		resp, _, err := c.Exchange(req, addr)
+		resp, err := server.Exchange(req)
 		if err == nil {
 			cs.cache.cacheResponse(req, resp)
-			zap.L().Info("succeed to get response", zap.String("response", fmt.Sprintf("%v", resp) ) )
+			zap.L().Info("succeed to get response", zap.String("response", fmt.Sprintf("%v", resp)))
 			w.WriteMsg(resp)
 			return
 		}
 	}
-	zap.L().Error("fail to process request", zap.String("request", fmt.Sprintf("%v", req) ) )
+	zap.L().Error("fail to process request", zap.String("request", fmt.Sprintf("%v", req)))
 }

@@ -1,0 +1,10 @@
+caches:
+- listenAddrs:
+  - 127.0.0.1:8989
+  dnsServers:
+  - 8.8.8.8:53
+  - 8.8.4.4:53
+- listenAddrs:
+  - tcp:127.0.0.1:9090
+  dnsServers:
+  - 8.8.8.8:53 
